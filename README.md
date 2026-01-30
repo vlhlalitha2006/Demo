@@ -62,6 +62,8 @@ pip install -r requirements.txt
 
 YOLOv8 weights are downloaded automatically on first run.
 
+**Browser video playback:** The pipeline writes the processed video; if OpenCV uses the `mp4v` codec, the file is re-encoded to H.264 using **ffmpeg** so it plays in the dashboard. Install ffmpeg (e.g. `brew install ffmpeg` on macOS) for reliable playback; otherwise install a build of OpenCV with H.264 support.
+
 ## How to run the upgraded system
 
 ### 1. CLI (process a video)

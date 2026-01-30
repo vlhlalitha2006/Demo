@@ -45,7 +45,7 @@ class RashDrivingAnalyzer:
 
     def __init__(
         self,
-        min_traj_len: int = cfg.RASH_MIN_TRAJECTORY_LEN,
+        min_traj_len: int = max(10, cfg.RASH_MIN_TRAJECTORY_LEN), # Ensure at least 10 frames
         sharp_turn_deg: float = cfg.RASH_SHARP_TURN_ANGLE_DEG,
         accel_ratio: float = cfg.RASH_ACCELERATION_RATIO,
         speed_percentile: float = cfg.RASH_SPEED_PERCENTILE,
@@ -58,7 +58,8 @@ class RashDrivingAnalyzer:
         self.min_speed_px = min_speed_px
         self.events: List[RashDrivingEvent] = []
         self._recent_speeds: List[float] = []
-        self._max_recent = 100
+        self._max_recent = 200 # larger pool for more stable percentile
+        self._flagged_ids_per_reason: Dict[tuple[int, str], int] = {} # (tid, reason) -> last_frame_idx
 
     def update(
         self,
@@ -71,55 +72,55 @@ class RashDrivingAnalyzer:
         velocities: id -> speed (px/frame)
         """
         new_events: List[RashDrivingEvent] = []
+        
+        # Only add valid speeds to the pool
         speeds = [s for s in velocities.values() if s > 0]
-        self._recent_speeds = (self._recent_speeds + speeds)[-self._max_recent:]
-        pct = np.percentile(self._recent_speeds, self.speed_percentile) if self._recent_speeds else 0.0
+        if speeds:
+            self._recent_speeds.extend(speeds)
+            self._recent_speeds = self._recent_speeds[-self._max_recent:]
+            
+        pct = np.percentile(self._recent_speeds, self.speed_percentile) if len(self._recent_speeds) > 20 else 100.0 # Need some data first
 
         for tid, traj in trajectories.items():
             if len(traj) < self.min_traj_len:
                 continue
-            traj = traj[-self.min_traj_len - 2:]
+            
+            # Use a slightly longer window for turn analysis
+            traj_window = traj[-self.min_traj_len:]
             speed = velocities.get(tid, 0.0)
 
-            # Sharp turn
-            pts = np.array([(t[1], t[2]) for t in traj])
-            for i in range(2, len(pts)):
-                v1 = pts[i - 1] - pts[i - 2]
-                v2 = pts[i] - pts[i - 1]
-                if np.linalg.norm(v1) < 1e-6 or np.linalg.norm(v2) < 1e-6:
-                    continue
-                ang = _angle_deg(v1, v2)
-                if ang >= self.sharp_turn_deg:
-                    evt = RashDrivingEvent(
-                        track_id=tid,
-                        frame_idx=frame_idx,
-                        reason=f"Sharp direction change ({ang:.0f}°)",
-                    )
-                    self.events.append(evt)
-                    new_events.append(evt)
-                    break
+            # 1. Sharp turn (check last few segments)
+            pts = np.array([(t[1], t[2]) for t in traj_window])
+            if len(pts) >= 5:
+                # Average direction of last 2 segments vs previous 2
+                v_recent = pts[-1] - pts[-3]
+                v_prev = pts[-3] - pts[-5]
+                if np.linalg.norm(v_recent) > 1.0 and np.linalg.norm(v_prev) > 1.0:
+                    ang = _angle_deg(v_prev, v_recent)
+                    if ang >= self.sharp_turn_deg:
+                        self._trigger_event(tid, frame_idx, f"Sharp turn ({ang:.0f}°)", new_events)
 
-            # Sudden acceleration (compare consecutive speeds from trajectory)
-            if len(traj) >= 3:
-                d1 = np.hypot(traj[-2][1] - traj[-3][1], traj[-2][2] - traj[-3][2])
-                d2 = np.hypot(traj[-1][1] - traj[-2][1], traj[-1][2] - traj[-2][2])
-                if d1 > 0.5 and d2 / d1 >= self.accel_ratio:
-                    evt = RashDrivingEvent(
-                        track_id=tid,
-                        frame_idx=frame_idx,
-                        reason=f"Sudden acceleration (ratio {d2 / d1:.1f})",
-                    )
-                    self.events.append(evt)
-                    new_events.append(evt)
 
-            # Abnormally high speed
-            if speed >= self.min_speed_px and pct > 0 and speed >= pct:
-                evt = RashDrivingEvent(
-                    track_id=tid,
-                    frame_idx=frame_idx,
-                    reason=f"Abnormally high speed ({speed:.1f} px/frame, >{self.speed_percentile}th %ile)",
-                )
-                self.events.append(evt)
-                new_events.append(evt)
+            # 2. Sudden acceleration
+            if len(traj_window) >= 3:
+                d1 = np.hypot(traj_window[-2][1] - traj_window[-3][1], traj_window[-2][2] - traj_window[-3][2])
+                d2 = np.hypot(traj_window[-1][1] - traj_window[-2][1], traj_window[-1][2] - traj_window[-2][2])
+                if d1 > 1.0 and d2 / d1 >= self.accel_ratio:
+                    self._trigger_event(tid, frame_idx, f"Sudden accel (x{d2/d1:.1f})", new_events)
+
+            # 3. Abnormally high speed
+            if speed >= self.min_speed_px and speed >= pct:
+                self._trigger_event(tid, frame_idx, "High speed", new_events)
 
         return new_events
+
+    def _trigger_event(self, tid: int, frame_idx: int, reason: str, event_list: List[RashDrivingEvent]):
+        """Helper to append event and log, with cooldown to avoid duplicates."""
+        last_f = self._flagged_ids_per_reason.get((tid, reason), -100)
+        cooldown = 30 # frames (approx 3 seconds at 10fps)
+        if frame_idx - last_f > cooldown:
+            evt = RashDrivingEvent(track_id=tid, frame_idx=frame_idx, reason=reason)
+            self.events.append(evt)
+            event_list.append(evt)
+            self._flagged_ids_per_reason[(tid, reason)] = frame_idx
+

@@ -89,12 +89,24 @@ class VehicleTracker:
                     if track_id not in self.trajectories:
                         self.trajectories[track_id] = []
                     self.trajectories[track_id].append((self._frame_index, cx, cy))
-                    # velocity from previous point
+                    
+                    # Compute velocity with smoothing (last 3-5 frames)
                     hist = self.trajectories[track_id]
                     if len(hist) >= 2:
-                        _, px, py = hist[-2]
-                        speed = np.hypot(cx - px, cy - py)
-                        self._last_velocities[track_id] = speed
+                        window = hist[-5:] # look at last 5 frames
+                        displacements = []
+                        for j in range(1, len(window)):
+                            prev = window[j-1]
+                            curr = window[j]
+                            d = np.hypot(curr[1] - prev[1], curr[2] - prev[2])
+                            dt = curr[0] - prev[0]
+                            if dt > 0:
+                                displacements.append(d / dt)
+                        
+                        if displacements:
+                            # Moving average
+                            speed = sum(displacements) / len(displacements)
+                            self._last_velocities[track_id] = speed
         self._frame_index += 1
         self._prune_old_tracks()
         return np.array(out) if out else np.zeros((0, 7))

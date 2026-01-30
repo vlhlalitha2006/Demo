@@ -1,18 +1,19 @@
 """
 Streamlit dashboard for the Intelligent Traffic Monitoring System.
 Upload a video, run the pipeline (or load existing results), view original + processed
-video side-by-side with playback controls, set queue ROI, and explore analytics + CSV/charts.
+video side-by-side with native video playback (play/pause/seek), set queue ROI,
+and explore professional analytics with Plotly charts and summary metrics.
 """
 
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import streamlit as st
-import cv2
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 import config as cfg
 
@@ -44,14 +45,6 @@ def main() -> None:
     proj_root = Path(__file__).resolve().parent
     output_dir = proj_root / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Session state for playback
-    if "frame_idx" not in st.session_state:
-        st.session_state.frame_idx = 0
-    if "playing" not in st.session_state:
-        st.session_state.playing = False
-    if "play_speed" not in st.session_state:
-        st.session_state.play_speed = 1.0
 
     # Sidebar: input source
     st.sidebar.header("Input")
@@ -104,7 +97,6 @@ def main() -> None:
                 stats_data = load_stats(stats_path)
                 if not stats_data:
                     st.sidebar.warning("No stats JSON found for this video.")
-                # Optional: original video for side-by-side when using existing output
                 orig_for_existing = st.sidebar.text_input(
                     "Original video path (optional, for side-by-side)",
                     "",
@@ -113,7 +105,7 @@ def main() -> None:
                 if orig_for_existing.strip() and Path(orig_for_existing.strip()).is_file():
                     video_path = Path(orig_for_existing.strip())
 
-    # Sidebar: Queue ROI (user-defined)
+    # Sidebar: Queue ROI
     st.sidebar.header("Queue ROI")
     use_custom_roi = st.sidebar.checkbox("Use custom queue ROI", value=False)
     queue_roi_normalized: list[float] | None = None
@@ -138,6 +130,14 @@ def main() -> None:
     process_fps = st.sidebar.slider("Process FPS", 2, 30, int(cfg.PROCESS_FPS))
     max_frames = st.sidebar.number_input("Max frames (0 = all)", 0, 100000, 0)
     max_frames = None if max_frames == 0 else max_frames
+    stop_line_y_input = st.sidebar.number_input(
+        "Stop line Y (pixels from top; 0 = auto from config)",
+        0,
+        5000,
+        0,
+        help="Red line position. 0 uses config default (or auto if off-screen).",
+    )
+    stop_line_y = None if stop_line_y_input == 0 else float(stop_line_y_input)
 
     run_process = st.sidebar.button("Run pipeline", type="primary")
 
@@ -153,6 +153,7 @@ def main() -> None:
                     output_stats_path=out_s,
                     process_fps=float(process_fps),
                     max_frames=max_frames,
+                    stop_line_y=stop_line_y,
                     queue_roi_normalized=queue_roi_normalized,
                     roi_override_path=str(roi_path) if roi_path else None,
                 )
@@ -167,142 +168,286 @@ def main() -> None:
         if overlay_path.is_file():
             stats_data = load_stats(output_dir / f"{video_path.stem}_stats.json")
 
-    # Metrics panel
+    # Sidebar metrics
     st.sidebar.header("Metrics")
     if stats_data and "summary" in stats_data:
         s = stats_data["summary"]
         st.sidebar.metric("Total vehicles", s.get("total_vehicles", "—"))
-        st.sidebar.metric("Red-light violations", s.get("red_light_violations", "—"))
-        st.sidebar.metric("Rash driving events", s.get("rash_driving_events", "—"))
-        st.sidebar.metric("Speed violations", s.get("speed_violations", "—"))
+        st.sidebar.metric("Red-light (unique vehicles)", s.get("red_light_violations", "—"))
+        st.sidebar.metric("Rash driving (unique vehicles)", s.get("rash_driving_unique_vehicles", s.get("rash_driving_events", "—")))
+        st.sidebar.metric("Speed violations (unique)", s.get("speed_violations", "—"))
         st.sidebar.metric("Frames processed", s.get("frames_processed", "—"))
     else:
         st.sidebar.info("Run the pipeline or load existing output to see metrics.")
 
-    # Main area: side-by-side video + playback controls
+    # -------------------------------------------------------------------------
+    # MAIN: Video playback (st.video — continuous play, native controls)
+    # -------------------------------------------------------------------------
     if overlay_path and overlay_path.is_file():
-        cap_o = cv2.VideoCapture(str(overlay_path))
-        total_f = int(cap_o.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap_o.release()
+        st.subheader("Video playback")
+        st.caption(
+            "Both videos support play, pause, and seek. "
+            "Processed video is at pipeline FPS; for sync, seek to similar relative position."
+        )
 
-        # Playback controls: play/pause, seek, speed
-        st.subheader("Playback")
-        c_play, c_seek, c_speed = st.columns([1, 3, 1])
-        with c_play:
-            if st.button("▶ Play" if not st.session_state.playing else "⏸ Pause"):
-                st.session_state.playing = not st.session_state.playing
-        with c_speed:
-            play_speed = st.select_slider("Speed", options=[0.5, 1.0, 1.5, 2.0], value=1.0)
-            st.session_state.play_speed = play_speed
+        col_orig, col_proc = st.columns(2)
 
-        if total_f > 1:
-            frame_idx = st.slider(
-                "Seek frame",
-                0,
-                total_f - 1,
-                st.session_state.frame_idx,
-                key="seek_slider",
-            )
-            st.session_state.frame_idx = frame_idx
-            # Auto-advance when playing
-            if st.session_state.playing:
-                st.session_state.frame_idx = (frame_idx + 1) % total_f
-                time.sleep(0.5 / st.session_state.play_speed)
-                st.rerun()
-        elif total_f == 1:
-            frame_idx = 0
-            st.write("Frame: 0")
-        else:
-            st.warning("Video has no frames.")
-            frame_idx = 0
+        def _show_video(path: Path, max_mb: int = 500) -> bool:
+            """Render video via st.video; use bytes for reliable browser playback (H.264). Returns True if shown."""
+            if not path.is_file():
+                return False
+            size_mb = path.stat().st_size / (1024 * 1024)
+            if size_mb > max_mb:
+                st.warning(f"Video is {size_mb:.0f} MB (max {max_mb} MB for inline playback). Download from output folder.")
+                return False
+            try:
+                # Serve as bytes so browser gets the file directly (works with H.264 from pipeline)
+                with open(path, "rb") as f:
+                    st.video(f.read(), format="video/mp4")
+                return True
+            except Exception as e:
+                try:
+                    st.video(str(path), format="video/mp4")
+                    return True
+                except Exception:
+                    st.error(f"Could not load video: {e}")
+                    return False
 
-        if total_f > 0:
-            # Processed frame
-            cap_o = cv2.VideoCapture(str(overlay_path))
-            cap_o.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret_o, frame_o = cap_o.read()
-            cap_o.release()
-
-            # Original frame (if we have source video)
-            frame_orig = None
+        with col_orig:
+            st.markdown("**Original input**")
             if video_path is not None and video_path.is_file():
-                cap_orig = cv2.VideoCapture(str(video_path))
-                total_orig = int(cap_orig.get(cv2.CAP_PROP_FRAME_COUNT))
-                # Map processed frame index to original (processed at process_fps)
-                orig_idx = min(
-                    int(frame_idx / max(1, total_f - 1) * (total_orig - 1)) if total_orig > 1 else 0,
-                    total_orig - 1,
-                )
-                cap_orig.set(cv2.CAP_PROP_POS_FRAMES, orig_idx)
-                ret_orig, frame_orig = cap_orig.read()
-                cap_orig.release()
+                if not _show_video(video_path):
+                    st.info("Use **Original video path** in sidebar when selecting existing output.")
+            else:
+                st.info("Select a source video and run the pipeline to see the original here.")
 
-            col_orig, col_proc = st.columns(2)
-            with col_orig:
-                if frame_orig is not None:
-                    st.caption("Original input")
-                    st.image(cv2.cvtColor(frame_orig, cv2.COLOR_BGR2RGB), use_container_width=True)
-                else:
-                    st.caption("Original input")
-                    st.info("Select a source video and run pipeline to see original here.")
-            with col_proc:
-                st.caption("Processed output (analytics overlay)")
-                if ret_o and frame_o is not None:
-                    st.image(cv2.cvtColor(frame_o, cv2.COLOR_BGR2RGB), use_container_width=True)
-                else:
-                    st.warning("Could not read frame.")
+        with col_proc:
+            st.markdown("**Processed output (annotated)**")
+            _show_video(overlay_path)
 
-        # Per-frame stats
-        if stats_data and "per_frame" in stats_data:
+        st.markdown("---")
+
+        # -------------------------------------------------------------------------
+        # Summary metric cards
+        # -------------------------------------------------------------------------
+        if stats_data and "summary" in stats_data and "per_frame" in stats_data:
+            s = stats_data["summary"]
             pf = stats_data["per_frame"]
-            if 0 <= frame_idx < len(pf):
-                f = pf[frame_idx]
-                st.subheader("Per-frame stats")
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.metric("Queue length", f.get("queue_length", "—"))
-                with c2:
-                    st.metric("Queue density", f"{f.get('queue_density', 0):.4f}")
-                with c3:
-                    st.metric("Total vehicles (so far)", f.get("total_vehicles", "—"))
-                with c4:
-                    st.metric("Speed violations (frame)", f.get("speed_violations", 0))
+            df = pd.DataFrame(pf)
 
-        # Data export & visualizations
-        if stats_data and "per_frame" in stats_data and stats_data["per_frame"]:
-            st.subheader("Data & visualizations")
-            df = pd.DataFrame(stats_data["per_frame"])
-            csv_path = Path(overlay_path).with_suffix(".csv")
-            csv_path = overlay_path.parent / (overlay_path.stem.replace("_overlay", "") + "_stats.csv")
-            if csv_path.is_file():
-                with open(csv_path) as f:
-                    st.download_button(
-                        "Download per-frame CSV",
-                        data=f.read(),
-                        file_name=csv_path.name,
-                        mime="text/csv",
-                    )
-            summary_path = overlay_path.parent / (
-                overlay_path.stem.replace("_overlay", "") + "_stats_summary.csv"
+            peak_queue = int(df["queue_length"].max()) if "queue_length" in df.columns and len(df) else 0
+            peak_density = float(df["queue_density"].max()) if "queue_density" in df.columns and len(df) else 0.0
+            total_violations = (
+                s.get("red_light_violations", 0)
+                + s.get("rash_driving_unique_vehicles", s.get("rash_driving_events", 0))
+                + s.get("speed_violations", 0)
             )
-            if summary_path.is_file():
-                with open(summary_path) as f:
-                    st.download_button(
-                        "Download summary CSV",
-                        data=f.read(),
-                        file_name=summary_path.name,
-                        mime="text/csv",
-                        key="dl_summary",
-                    )
 
-            tab1, tab2, tab3 = st.tabs(["Vehicle count", "Queue density", "Violations"])
-            with tab1:
-                st.line_chart(df.set_index("frame_idx")[["total_vehicles"]])
-            with tab2:
-                st.line_chart(df.set_index("frame_idx")[["queue_length", "queue_density"]])
-            with tab3:
-                viol_df = df[["frame_idx", "red_light_violations", "rash_driving_events", "speed_violations"]].set_index("frame_idx")
-                st.bar_chart(viol_df)
+            # Verification: metrics are from video analysis, not AI-generated
+            st.info(
+                "**Accurate counts (from video only):** "
+                "Vehicle count = unique tracks seen for **≥5 frames** (reduces false positives). "
+                "Violations = **unique vehicles** per type (red-light, rash, speed). "
+                "All values are computed from detection + tracking + rules — no synthetic or AI-generated numbers."
+            )
+            st.subheader("Summary metrics")
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Total vehicles detected", s.get("total_vehicles", "—"))
+            with m2:
+                st.metric("Peak queue length", peak_queue)
+            with m3:
+                st.metric("Peak queue density", f"{peak_density:.4f}")
+            with m4:
+                st.metric("Total violations", total_violations)
+
+            st.markdown("---")
+            # Vehicle Violations section: who did what, downloadable
+            if stats_data.get("violations"):
+                st.subheader("Vehicle violations (who did what)")
+                viol_df = pd.DataFrame(stats_data["violations"])
+                st.dataframe(
+                    viol_df,
+                    column_config={
+                        "vehicle_id": "Vehicle ID",
+                        "frame_idx": "Frame",
+                        "violation_type": "Type",
+                        "description": "Description",
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                v1, v2 = st.columns(2)
+                with v1:
+                    csv_content = viol_df.to_csv(index=False)
+                    st.download_button(
+                        "Download violations (CSV)",
+                        data=csv_content,
+                        file_name="violations.csv",
+                        mime="text/csv",
+                        key="dl_viol_csv",
+                    )
+                with v2:
+                    try:
+                        from fpdf import FPDF
+                        pdf = FPDF()
+                        pdf.add_page()
+                        pdf.set_font("Helvetica", "B", 14)
+                        pdf.cell(0, 10, "Vehicle Violations Report", ln=True)
+                        pdf.set_font("Helvetica", "", 10)
+                        pdf.cell(0, 6, "Computed from video analysis (detection + tracking + rules).", ln=True)
+                        pdf.ln(4)
+                        pdf.set_font("Helvetica", "B", 9)
+                        pdf.cell(40, 6, "Vehicle ID", border=1)
+                        pdf.cell(25, 6, "Frame", border=1)
+                        pdf.cell(35, 6, "Type", border=1)
+                        pdf.cell(90, 6, "Description", border=1)
+                        pdf.ln()
+                        pdf.set_font("Helvetica", "", 9)
+                        for _, row in viol_df.iterrows():
+                            pdf.cell(40, 6, str(row.get("vehicle_id", "")), border=1)
+                            pdf.cell(25, 6, str(row.get("frame_idx", "")), border=1)
+                            pdf.cell(35, 6, str(row.get("violation_type", ""))[:20], border=1)
+                            pdf.cell(90, 6, str(row.get("description", ""))[:55], border=1)
+                            pdf.ln()
+                        pdf_bytes = bytes(pdf.output())
+                        st.download_button(
+                            "Download violations (PDF)",
+                            data=pdf_bytes,
+                            file_name="violations.pdf",
+                            mime="application/pdf",
+                            key="dl_viol_pdf",
+                        )
+                    except ImportError:
+                        st.caption("PDF: pip install fpdf2")
+                    except Exception as e:
+                        st.caption(f"PDF: {e}")
+            else:
+                st.subheader("Vehicle violations")
+                st.caption("Run the pipeline to see violation details (red-light, rash driving, overspeed).")
+
+            # Helmet check note (placeholder until custom model is integrated)
+            with st.expander("Helmet verification (bike / motorcycle riders)"):
+                st.caption(
+                    "Helmet verification for passengers on bikes requires **person + helmet detection**. "
+                    "COCO does not include a helmet class. To enable: integrate a custom YOLO or classifier "
+                    "trained for helmet detection and use `analytics/helmet_check.py` to pair riders with bikes."
+                )
+
+            st.markdown("---")
+            st.subheader("Analytics")
+
+            # Time-series: vehicle count, queue length, queue density
+            if "frame_idx" in df.columns:
+                df_ts = df.copy()
+                df_ts["time_s"] = df_ts["frame_idx"] / max(s.get("process_fps", 1), 1e-6)
+
+                fig_ts = make_subplots(
+                    rows=3,
+                    cols=1,
+                    subplot_titles=(
+                        "Total vehicle count over time",
+                        "Queued vehicle count over time",
+                        "Queue density over time",
+                    ),
+                    vertical_spacing=0.08,
+                    shared_xaxes=True,
+                )
+                fig_ts.add_trace(
+                    go.Scatter(
+                        x=df_ts["time_s"],
+                        y=df_ts["total_vehicles"],
+                        name="Total vehicles",
+                        line=dict(color="#2ecc71", width=2),
+                    ),
+                    row=1,
+                    col=1,
+                )
+                fig_ts.add_trace(
+                    go.Scatter(
+                        x=df_ts["time_s"],
+                        y=df_ts["queue_length"],
+                        name="Queue length",
+                        line=dict(color="#e74c3c", width=2),
+                    ),
+                    row=2,
+                    col=1,
+                )
+                fig_ts.add_trace(
+                    go.Scatter(
+                        x=df_ts["time_s"],
+                        y=df_ts["queue_density"],
+                        name="Queue density",
+                        line=dict(color="#3498db", width=2),
+                    ),
+                    row=3,
+                    col=1,
+                )
+                fig_ts.update_layout(
+                    height=500,
+                    showlegend=True,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    margin=dict(t=60, b=40),
+                )
+                fig_ts.update_xaxes(title_text="Time (s)", row=3, col=1)
+                fig_ts.update_yaxes(title_text="Count", row=1, col=1)
+                fig_ts.update_yaxes(title_text="Count", row=2, col=1)
+                fig_ts.update_yaxes(title_text="Density", row=3, col=1)
+                st.plotly_chart(fig_ts, use_container_width=True)
+
+            # Violations by type (bar chart)
+            viol_labels = ["Red-light", "Rash driving", "Speed"]
+            viol_values = [
+                s.get("red_light_violations", 0),
+                s.get("rash_driving_unique_vehicles", s.get("rash_driving_events", 0)),
+                s.get("speed_violations", 0),
+            ]
+            fig_bar = go.Figure(
+                data=[
+                    go.Bar(
+                        x=viol_labels,
+                        y=viol_values,
+                        marker_color=["#e74c3c", "#f39c12", "#e67e22"],
+                        text=viol_values,
+                        textposition="outside",
+                    )
+                ]
+            )
+            fig_bar.update_layout(
+                title="Violations by type",
+                xaxis_title="Type",
+                yaxis_title="Count",
+                height=350,
+                margin=dict(t=50, b=40),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+            # CSV download
+            st.subheader("Data export")
+            stem = overlay_path.stem.replace("_overlay", "")
+            csv_path = overlay_path.parent / f"{stem}_stats.csv"
+            summary_path = overlay_path.parent / f"{stem}_stats_summary.csv"
+            d1, d2 = st.columns(2)
+            with d1:
+                if csv_path.is_file():
+                    with open(csv_path) as f:
+                        st.download_button(
+                            "Download per-frame CSV",
+                            data=f.read(),
+                            file_name=csv_path.name,
+                            mime="text/csv",
+                        )
+            with d2:
+                if summary_path.is_file():
+                    with open(summary_path) as f:
+                        st.download_button(
+                            "Download summary CSV",
+                            data=f.read(),
+                            file_name=summary_path.name,
+                            mime="text/csv",
+                            key="dl_summary",
+                        )
     else:
         st.info(
             "Upload a video and run the pipeline, or select existing output, "
@@ -311,10 +456,11 @@ def main() -> None:
 
     st.sidebar.header("About")
     st.sidebar.markdown(
-        "• **Detection**: YOLOv8 (car, bike, bus, truck)  \n"
-        "• **Tracking**: ByteTrack (unique IDs, no double count)  \n"
+        "• **Detection**: YOLOv8 (car, bike, bus, truck, bicycle)  \n"
+        "• **Tracking**: ByteTrack (unique IDs, occlusion handling)  \n"
         "• **Queue**: User ROI + waiting vehicles (speed threshold)  \n"
-        "• **Violations**: Red-light jump, rash driving, overspeed (pixel-to-meter)"
+        "• **Violations**: Red-light, rash driving, overspeed  \n"
+        "• **Helmet**: Custom model required (see dashboard section)"
     )
 
 

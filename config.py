@@ -28,24 +28,29 @@ MAX_FRAMES = None
 # -----------------------------------------------------------------------------
 # VEHICLE DETECTION (YOLOv8)
 # -----------------------------------------------------------------------------
-# COCO classes for vehicles: 2=car, 3=motorcycle, 5=bus, 7=truck.
-# "Auto" (auto-rickshaw) is often detected as car/motorcycle; we include both.
-VEHICLE_CLASS_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck
-VEHICLE_CLASS_NAMES = ["car", "bike", "bus", "truck"]  # map by index in above list
-# Minimum confidence to consider a detection valid
-DETECTION_CONFIDENCE = 0.5
+# COCO classes: 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck.
+# Bicycles included for two-wheeler coverage; motorcycle = bike.
+VEHICLE_CLASS_IDS = [2, 3, 5, 7, 1]  # car, motorcycle, bus, truck, bicycle
+VEHICLE_CLASS_NAMES = ["car", "bike", "bus", "truck", "bicycle"]  # map by index in above list
+# Minimum confidence for most vehicles
+DETECTION_CONFIDENCE = 0.35
+# Lower confidence for motorcycles and bicycles (often smaller / partially occluded)
+MOTORCYCLE_CONFIDENCE = 0.25
+BICYCLE_CONFIDENCE = 0.25
 # Model size: nano/small/medium/large. Smaller = faster, less accurate.
-YOLO_MODEL_SIZE = "n"
+YOLO_MODEL_SIZE = "s"
 
 # -----------------------------------------------------------------------------
 # MULTI-OBJECT TRACKING (ByteTrack via Ultralytics)
 # -----------------------------------------------------------------------------
 # Tracker name: "bytetrack" or "botsort". ByteTrack is default, good for vehicles.
 TRACKER_NAME = "bytetrack"
-# Max age (frames) to keep a lost track before removing. Reduces double-counting.
-TRACK_MAX_AGE = 30
-# Minimum hits before a track is confirmed. Filters spurious detections.
+# Max age (frames) to keep a lost track before removing. Higher = better occlusion handling.
+TRACK_MAX_AGE = 100
+# Minimum hits before a track is confirmed. Lower = faster recovery after occlusion.
 TRACK_MIN_HITS = 3
+# Minimum frames a track must be seen before counting as a vehicle (reduces false positives).
+MIN_FRAMES_TO_COUNT_VEHICLE = 5
 
 # -----------------------------------------------------------------------------
 # TRAFFIC SIGNAL & STOP LINE
@@ -55,8 +60,10 @@ TRACK_MIN_HITS = 3
 DEFAULT_SIGNAL_STATE = "RED"
 # Stop line: defined as a horizontal line y = STOP_LINE_Y (pixels from top).
 # Vehicles crossing below this (in image coords) during RED = violation.
-# Tune based on your video resolution and camera angle.
-STOP_LINE_Y = 400
+# Tune based on your video resolution and camera angle (e.g. 0.4 * height for typical intersection).
+STOP_LINE_Y = 1600
+# Thickness of stop line in overlay (pixels) so it is visible in most videos.
+STOP_LINE_THICKNESS = 4
 # Small buffer (pixels) to avoid duplicate violation triggers for same vehicle.
 STOP_LINE_CROSS_BUFFER = 10
 
@@ -71,10 +78,12 @@ QUEUE_ROI_NORMALIZED = [0.1, 0.3, 0.9, 0.7]  # x1, y1, x2, y2
 # Speed threshold: vehicles with speed (pixels/frame) below this are "waiting".
 # Tune per video FPS and resolution.
 SPEED_THRESHOLD_PX_PER_FRAME = 2.0
-# Queue region area (m² or arbitrary). For density we use pixel area if no calibration.
-# Using normalized area * 1e4 as proxy so density is readable.
-QUEUE_AREA_NORMALIZED = (QUEUE_ROI_NORMALIZED[2] - QUEUE_ROI_NORMALIZED[0]) * (
-    QUEUE_ROI_NORMALIZED[3] - QUEUE_ROI_NORMALIZED[1]
+# Queue region area (m² or arbitrary). For density we use pixel area if no calibration.)
+# Using normalized area as proxy so density is readable (e.g. vehicles per 0.1 normalized area)
+QUEUE_AREA_NORMALIZED = max(
+    (QUEUE_ROI_NORMALIZED[2] - QUEUE_ROI_NORMALIZED[0])
+    * (QUEUE_ROI_NORMALIZED[3] - QUEUE_ROI_NORMALIZED[1]),
+    0.01,
 )
 
 # -----------------------------------------------------------------------------
@@ -117,6 +126,8 @@ ROI_OVERRIDE_PATH = None  # e.g. OUTPUT_DIR / "roi.json"
 BOX_THICKNESS = 2
 FONT_SCALE = 0.6
 FONT_THICKNESS = 1
+# Stop line drawn with this thickness so it is visible in most resolutions.
+STOP_LINE_VIS_THICKNESS = 4
 # Colors (BGR)
 COLOR_RED = (0, 0, 255)
 COLOR_GREEN = (0, 255, 0)

@@ -41,14 +41,30 @@ class VehicleDetector:
         model_name = f"yolov8{model_size}.pt"
         self.model = YOLO(model_name)
 
+    def _min_confidence_for_class(self, class_id: int) -> float:
+        """Per-class confidence: lower for motorcycle and bicycle for better detection."""
+        motorcycle_conf = getattr(cfg, "MOTORCYCLE_CONFIDENCE", None)
+        bicycle_conf = getattr(cfg, "BICYCLE_CONFIDENCE", None)
+        if motorcycle_conf is not None and class_id == 3:  # COCO motorcycle
+            return motorcycle_conf
+        if bicycle_conf is not None and class_id == 1:  # COCO bicycle
+            return bicycle_conf
+        return self.conf
+
     def detect(self, frame: np.ndarray) -> np.ndarray:
         """
         Run detection on a BGR frame.
         Returns (N, 6) array: [x1, y1, x2, y2, conf, class_id].
+        Uses lower confidence for motorcycle and bicycle for better bike detection.
         """
+        min_conf = min(
+            self.conf,
+            getattr(cfg, "MOTORCYCLE_CONFIDENCE", self.conf),
+            getattr(cfg, "BICYCLE_CONFIDENCE", self.conf),
+        )
         results = self.model.predict(
             frame,
-            conf=self.conf,
+            conf=min_conf,
             classes=self.vehicle_classes,
             verbose=False,
         )
@@ -61,13 +77,16 @@ class VehicleDetector:
             conf = boxes.conf.cpu().numpy()
             cls = boxes.cls.cpu().numpy().astype(int)
             for i in range(len(boxes)):
+                cid = int(cls[i])
+                if float(conf[i]) < self._min_confidence_for_class(cid):
+                    continue
                 out.append([
                     float(xyxy[i, 0]),
                     float(xyxy[i, 1]),
                     float(xyxy[i, 2]),
                     float(xyxy[i, 3]),
                     float(conf[i]),
-                    int(cls[i]),
+                    cid,
                 ])
         return np.array(out) if out else np.zeros((0, 6))
 

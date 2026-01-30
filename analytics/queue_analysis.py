@@ -59,9 +59,8 @@ class QueueAnalyzer:
         y1 = int(self.roi_n[1] * h)
         x2 = int(self.roi_n[2] * w)
         y2 = int(self.roi_n[3] * h)
-        area = (x2 - x1) * (y2 - y1)
-        if area <= 0:
-            area = 1.0
+        area_n = (self.roi_n[2] - self.roi_n[0]) * (self.roi_n[3] - self.roi_n[1])
+        area_n = max(area_n, 0.01)
 
         waiting = set()
         for (tid, x1_, y1_, x2_, y2_, speed) in tracks:
@@ -74,8 +73,8 @@ class QueueAnalyzer:
                 waiting.add(tid)
         self._waiting_ids = waiting
         length = len(waiting)
-        density = length / area if area else 0.0
-        return QueueMetrics(queue_length=length, queue_density=density, queue_region_area=float(area))
+        density = length / area_n
+        return QueueMetrics(queue_length=length, queue_density=density, queue_region_area=area_n)
 
     def get_queue_roi_pixels(self, frame_shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
         """Return (x1, y1, x2, y2) in pixel coords for drawing."""

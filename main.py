@@ -9,6 +9,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -36,6 +40,37 @@ def _signal_state_from_time(frame_idx: int, process_fps: float) -> str:
     period = 50.0
     phase = t % period
     return "RED" if phase < 30.0 else "GREEN"
+
+
+def _reencode_to_h264_for_browser(src_path: Path) -> bool:
+    """
+    Re-encode MP4 to H.264 (yuv420p, faststart) so it plays in browser video players.
+    OpenCV's mp4v codec often produces black/unplayable output in HTML5 video.
+    Returns True if re-encoding succeeded, False otherwise (original file unchanged).
+    """
+    tmp_path: Optional[Path] = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".mp4", prefix="traffic_")
+        os.close(fd)
+        tmp_path = Path(tmp)
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src_path),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-an", str(tmp_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        if result.returncode == 0 and tmp_path.is_file():
+            shutil.move(str(tmp_path), str(src_path))
+            return True
+        if tmp_path.is_file():
+            tmp_path.unlink(missing_ok=True)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        if tmp_path is not None and tmp_path.is_file():
+            tmp_path.unlink(missing_ok=True)
+    except Exception:
+        if tmp_path is not None and tmp_path.is_file():
+            tmp_path.unlink(missing_ok=True)
+    return False
 
 
 def _load_queue_roi(roi_override_path: Optional[Path] = None) -> List[float]:
@@ -77,7 +112,12 @@ def run_pipeline(
     h, w = proc.frame_shape
     proc.close()
 
-    stop_y = stop_line_y if stop_line_y is not None else min(cfg.STOP_LINE_Y, h - 1)
+    # Stop line: use provided value, or config; if config value is off-screen (e.g. > height), use fraction of height
+    if stop_line_y is not None:
+        stop_y = stop_line_y
+    else:
+        config_y = getattr(cfg, "STOP_LINE_Y", 400)
+        stop_y = min(config_y, h - 1) if config_y < h else int(0.4 * h)  # default ~40% from top when off-screen
     stop_y = max(0, min(stop_y, h - 1))
 
     roi = queue_roi_normalized if queue_roi_normalized is not None else _load_queue_roi(
@@ -102,14 +142,30 @@ def run_pipeline(
     prev_signal: Optional[str] = None
 
     out_video: Optional[cv2.VideoWriter] = None
+    used_mp4v_only = True  # Re-encode with ffmpeg only when OpenCV used mp4v
     if output_video_path:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out_video = cv2.VideoWriter(str(output_video_path), fourcc, process_fps, (w, h))
+        # Prefer H.264 so output plays in browser; fallback to mp4v (often shows black in HTML5)
+        for codec in ("avc1", "H264", "X264", "mp4v"):
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            out_video = cv2.VideoWriter(str(output_video_path), fourcc, process_fps, (w, h))
+            if out_video.isOpened():
+                used_mp4v_only = codec == "mp4v"
+                break
+            out_video.release()
+            out_video = None
+        if out_video is None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out_video = cv2.VideoWriter(str(output_video_path), fourcc, process_fps, (w, h))
 
     stats_per_frame: List[Dict[str, Any]] = []
     total_vehicles = 0
-    seen_ids: set[int] = set()
+    # Only count a vehicle when tracked for at least MIN_FRAMES_TO_COUNT_VEHICLE (avoids spurious IDs)
+    min_frames_to_count = getattr(cfg, "MIN_FRAMES_TO_COUNT_VEHICLE", 5)
+    confirmed_vehicle_ids: set[int] = set()
     seen_overspeed_ids: set[int] = set()
+    # Speed violation records (one per track, first frame); red_light and rash added after loop
+    speed_violation_records: List[Dict[str, Any]] = []
+    recorded_speed_violation_ids: set[int] = set()
 
     with VideoProcessor(video_path, process_fps=process_fps, max_frames=max_frames) as vp:
         for frame_idx, frame in vp.iter_frames():
@@ -124,11 +180,14 @@ def run_pipeline(
             if tracks.size == 0:
                 tracks = np.zeros((0, 7))
 
+            # Count only vehicles with enough trajectory length (confirmed tracks)
             for i in range(len(tracks)):
                 tid = int(tracks[i, 6])
                 if tid >= 0:
-                    seen_ids.add(tid)
-            total_vehicles = len(seen_ids)
+                    traj_len = len(tracker.trajectories.get(tid, []))
+                    if traj_len >= min_frames_to_count:
+                        confirmed_vehicle_ids.add(tid)
+            total_vehicles = len(confirmed_vehicle_ids)
 
             # Signal logic: (id, x1, y1, x2, y2)
             track_list = [
@@ -165,6 +224,16 @@ def run_pipeline(
                 getattr(cfg, "SPEED_LIMIT_KMH", 60.0),
             )
             seen_overspeed_ids.update(speed_violation_ids)
+            # Record speed violations once per track (first frame when exceeded)
+            for tid in speed_violation_ids:
+                if tid not in recorded_speed_violation_ids:
+                    recorded_speed_violation_ids.add(tid)
+                    speed_violation_records.append({
+                        "vehicle_id": tid,
+                        "frame_idx": frame_idx,
+                        "violation_type": "overspeed",
+                        "description": "Vehicle exceeded speed limit (km/h)",
+                    })
 
             queue_roi = queue_analyzer.get_queue_roi_pixels((h, w))
             overlay = draw_frame_overlay(
@@ -195,11 +264,37 @@ def run_pipeline(
 
     if out_video is not None:
         out_video.release()
+        # Re-encode mp4v output to H.264 so it plays in browser (st.video); mp4v often shows black
+        if output_video_path and used_mp4v_only:
+            _reencode_to_h264_for_browser(Path(output_video_path))
 
+    # Build full violation list for dashboard export (red_light, rash_driving, overspeed)
+    violation_records: List[Dict[str, Any]] = []
+    for evt in signal_logic.violations:
+        violation_records.append({
+            "vehicle_id": evt.track_id,
+            "frame_idx": evt.frame_idx,
+            "violation_type": "red_light",
+            "description": getattr(evt, "explanation", "Crossed stop line during RED signal"),
+        })
+    for evt in rash_analyzer.events:
+        violation_records.append({
+            "vehicle_id": evt.track_id,
+            "frame_idx": evt.frame_idx,
+            "violation_type": "rash_driving",
+            "description": evt.reason,
+        })
+    violation_records.extend(speed_violation_records)
+
+    # Violation counts: unique vehicles for red-light and speed; events + unique for rash
+    red_light_unique = len({e.track_id for e in signal_logic.violations})
+    rash_unique_vehicles = len({e.track_id for e in rash_analyzer.events})
     summary = {
         "total_vehicles": total_vehicles,
-        "red_light_violations": len(signal_logic.violations),
+        "red_light_violations": red_light_unique,
+        "red_light_events": len(signal_logic.violations),
         "rash_driving_events": len(rash_analyzer.events),
+        "rash_driving_unique_vehicles": rash_unique_vehicles,
         "speed_violations": len(seen_overspeed_ids),
         "frames_processed": len(stats_per_frame),
         "process_fps": process_fps,
@@ -207,7 +302,11 @@ def run_pipeline(
 
     if output_stats_path:
         with open(output_stats_path, "w") as f:
-            json.dump({"summary": summary, "per_frame": stats_per_frame}, f, indent=2)
+            json.dump({
+                "summary": summary,
+                "per_frame": stats_per_frame,
+                "violations": violation_records,
+            }, f, indent=2)
         # CSV export for analytics and visualization
         if export_csv and stats_per_frame:
             csv_path = Path(output_stats_path).with_suffix(".csv")
@@ -228,10 +327,23 @@ def run_pipeline(
                 writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
                 writer.writeheader()
                 writer.writerow(summary)
+        # Violations CSV for dashboard download
+        if violation_records:
+            viol_csv_path = Path(output_stats_path).parent / (
+                Path(output_stats_path).stem + "_violations.csv"
+            )
+            with open(viol_csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["vehicle_id", "frame_idx", "violation_type", "description"],
+                )
+                writer.writeheader()
+                writer.writerows(violation_records)
 
     return {
         "summary": summary,
         "per_frame": stats_per_frame,
+        "violations": violation_records,
         "output_video": str(output_video_path) if output_video_path else None,
         "output_stats": str(output_stats_path) if output_stats_path else None,
     }

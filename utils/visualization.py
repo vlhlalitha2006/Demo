@@ -51,12 +51,13 @@ def draw_frame_overlay(
             cv2.FONT_HERSHEY_SIMPLEX, cfg.FONT_SCALE, cfg.COLOR_QUEUE, cfg.FONT_THICKNESS,
         )
 
-    # Stop line
+    # Stop line (thick so visible in most videos; clamp y to frame height)
     h, w = out.shape[:2]
-    y = int(stop_line_y) if stop_line_y < h else h - 1
-    cv2.line(out, (0, y), (w, y), cfg.COLOR_STOP_LINE, 2)
+    y = max(0, min(int(stop_line_y), h - 1))
+    line_thick = getattr(cfg, "STOP_LINE_VIS_THICKNESS", 4)
+    cv2.line(out, (0, y), (w, y), cfg.COLOR_STOP_LINE, line_thick)
     cv2.putText(
-        out, "Stop line", (10, y - 8),
+        out, "Stop line", (10, max(20, y - 8)),
         cv2.FONT_HERSHEY_SIMPLEX, cfg.FONT_SCALE, cfg.COLOR_STOP_LINE, cfg.FONT_THICKNESS,
     )
 
