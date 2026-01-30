@@ -270,9 +270,8 @@ def main() -> None:
                     viol_df,
                     column_config={
                         "vehicle_id": "Vehicle ID",
-                        "frame_idx": "Frame",
-                        "violation_type": "Type",
-                        "description": "Description",
+                        "violation_types": "Violation types",
+                        "descriptions": "Descriptions",
                     },
                     use_container_width=True,
                     hide_index=True,
@@ -298,17 +297,15 @@ def main() -> None:
                         pdf.cell(0, 6, "Computed from video analysis (detection + tracking + rules).", ln=True)
                         pdf.ln(4)
                         pdf.set_font("Helvetica", "B", 9)
-                        pdf.cell(40, 6, "Vehicle ID", border=1)
-                        pdf.cell(25, 6, "Frame", border=1)
-                        pdf.cell(35, 6, "Type", border=1)
-                        pdf.cell(90, 6, "Description", border=1)
+                        pdf.cell(30, 6, "Vehicle ID", border=1)
+                        pdf.cell(50, 6, "Violation types", border=1)
+                        pdf.cell(110, 6, "Descriptions", border=1)
                         pdf.ln()
-                        pdf.set_font("Helvetica", "", 9)
+                        pdf.set_font("Helvetica", "", 8)
                         for _, row in viol_df.iterrows():
-                            pdf.cell(40, 6, str(row.get("vehicle_id", "")), border=1)
-                            pdf.cell(25, 6, str(row.get("frame_idx", "")), border=1)
-                            pdf.cell(35, 6, str(row.get("violation_type", ""))[:20], border=1)
-                            pdf.cell(90, 6, str(row.get("description", ""))[:55], border=1)
+                            pdf.cell(30, 6, str(row.get("vehicle_id", "")), border=1)
+                            pdf.cell(50, 6, str(row.get("violation_types", ""))[:45], border=1)
+                            pdf.cell(110, 6, str(row.get("descriptions", ""))[:75], border=1)
                             pdf.ln()
                         pdf_bytes = bytes(pdf.output())
                         st.download_button(
@@ -325,14 +322,6 @@ def main() -> None:
             else:
                 st.subheader("Vehicle violations")
                 st.caption("Run the pipeline to see violation details (red-light, rash driving, overspeed).")
-
-            # Helmet check note (placeholder until custom model is integrated)
-            with st.expander("Helmet verification (bike / motorcycle riders)"):
-                st.caption(
-                    "Helmet verification for passengers on bikes requires **person + helmet detection**. "
-                    "COCO does not include a helmet class. To enable: integrate a custom YOLO or classifier "
-                    "trained for helmet detection and use `analytics/helmet_check.py` to pair riders with bikes."
-                )
 
             st.markdown("---")
             st.subheader("Analytics")
@@ -459,8 +448,7 @@ def main() -> None:
         "• **Detection**: YOLOv8 (car, bike, bus, truck, bicycle)  \n"
         "• **Tracking**: ByteTrack (unique IDs, occlusion handling)  \n"
         "• **Queue**: User ROI + waiting vehicles (speed threshold)  \n"
-        "• **Violations**: Red-light, rash driving, overspeed  \n"
-        "• **Helmet**: Custom model required (see dashboard section)"
+        "• **Violations**: Red-light, rash driving, overspeed"
     )
 
 

@@ -99,17 +99,24 @@ SPEED_LIMIT_KMH = 60.0
 # RASH DRIVING HEURISTICS (rule-based, interpretable)
 # -----------------------------------------------------------------------------
 # Minimum trajectory length (frames) before evaluating rash driving.
-RASH_MIN_TRAJECTORY_LEN = 5
-# Sharp turn: max angle (degrees) between consecutive direction vectors.
-# Below this → sharp turn flagged.
-RASH_SHARP_TURN_ANGLE_DEG = 60
-# Sudden acceleration: ratio of consecutive speeds. Above → acceleration spike.
-RASH_ACCELERATION_RATIO = 2.0
-# Speed percentile (among recent vehicles) above which we flag "abnormally high speed".
-# E.g. 95 = top 5% fastest.
-RASH_SPEED_PERCENTILE = 95
+RASH_MIN_TRAJECTORY_LEN = 8
+# Sharp turn: angle (degrees) between direction vectors above this → flagged.
+# Higher = only very sharp direction changes (e.g. 75–90 for real rash turns).
+RASH_SHARP_TURN_ANGLE_DEG = 75
+# Minimum displacement (pixels) in each segment for sharp-turn check (avoids jitter).
+RASH_MIN_DISPLACEMENT_PX = 3.0
+# Sudden acceleration: ratio (d2/d1) above this → flagged. Require meaningful d1,d2.
+RASH_ACCELERATION_RATIO = 2.5
+# Minimum displacement in first segment (px) for acceleration check.
+RASH_ACCEL_MIN_D1_PX = 2.5
+# Minimum displacement in second segment (px) for acceleration check.
+RASH_ACCEL_MIN_D2_PX = 5.0
+# Speed percentile above which we flag "abnormally high speed" (98 = top 2%).
+RASH_SPEED_PERCENTILE = 98
 # Minimum speed (px/frame) to consider for "high speed" rash driving.
-RASH_MIN_SPEED_PX = 8.0
+RASH_MIN_SPEED_PX = 10.0
+# Cooldown (frames) before same vehicle can trigger same reason again.
+RASH_COOLDOWN_FRAMES = 45
 
 # -----------------------------------------------------------------------------
 # DATA LOGGING

@@ -268,23 +268,32 @@ def run_pipeline(
         if output_video_path and used_mp4v_only:
             _reencode_to_h264_for_browser(Path(output_video_path))
 
-    # Build full violation list for dashboard export (red_light, rash_driving, overspeed)
-    violation_records: List[Dict[str, Any]] = []
+    # Build violation list: one row per vehicle_id, all violation types and descriptions in single cells
+    vehicle_violations: Dict[int, List[tuple[str, str]]] = {}  # vehicle_id -> [(type, description), ...]
     for evt in signal_logic.violations:
-        violation_records.append({
-            "vehicle_id": evt.track_id,
-            "frame_idx": evt.frame_idx,
-            "violation_type": "red_light",
-            "description": getattr(evt, "explanation", "Crossed stop line during RED signal"),
-        })
+        vid = evt.track_id
+        if vid not in vehicle_violations:
+            vehicle_violations[vid] = []
+        vehicle_violations[vid].append(("red_light", getattr(evt, "explanation", "Crossed stop line during RED signal")))
     for evt in rash_analyzer.events:
+        vid = evt.track_id
+        if vid not in vehicle_violations:
+            vehicle_violations[vid] = []
+        vehicle_violations[vid].append(("rash_driving", evt.reason))
+    for rec in speed_violation_records:
+        vid = rec["vehicle_id"]
+        if vid not in vehicle_violations:
+            vehicle_violations[vid] = []
+        vehicle_violations[vid].append(("overspeed", "Vehicle exceeded speed limit (km/h)"))
+    violation_records: List[Dict[str, Any]] = []
+    for vehicle_id, pairs in sorted(vehicle_violations.items()):
+        types_str = "; ".join(t for t, _ in pairs)
+        desc_str = "; ".join(d for _, d in pairs)
         violation_records.append({
-            "vehicle_id": evt.track_id,
-            "frame_idx": evt.frame_idx,
-            "violation_type": "rash_driving",
-            "description": evt.reason,
+            "vehicle_id": vehicle_id,
+            "violation_types": types_str,
+            "descriptions": desc_str,
         })
-    violation_records.extend(speed_violation_records)
 
     # Violation counts: unique vehicles for red-light and speed; events + unique for rash
     red_light_unique = len({e.track_id for e in signal_logic.violations})
@@ -327,7 +336,7 @@ def run_pipeline(
                 writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
                 writer.writeheader()
                 writer.writerow(summary)
-        # Violations CSV for dashboard download
+        # Violations CSV: one row per vehicle_id, violation_types and descriptions in single cells
         if violation_records:
             viol_csv_path = Path(output_stats_path).parent / (
                 Path(output_stats_path).stem + "_violations.csv"
@@ -335,7 +344,7 @@ def run_pipeline(
             with open(viol_csv_path, "w", newline="") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=["vehicle_id", "frame_idx", "violation_type", "description"],
+                    fieldnames=["vehicle_id", "violation_types", "descriptions"],
                 )
                 writer.writeheader()
                 writer.writerows(violation_records)
