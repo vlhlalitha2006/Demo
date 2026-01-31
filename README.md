@@ -1,5 +1,7 @@
 # Intelligent Traffic Monitoring System
 
+Live Link: https://nzrpx2h5mwk9yrodea9pty.streamlit.app/
+
 An end-to-end traffic analytics pipeline using **YOLOv8**, **ByteTrack**, **OpenCV**, and **Streamlit**. It processes pre-recorded intersection CCTV footage to detect vehicles, track them, analyze queue length/density, and flag **red-light jump**, **rash driving**, and **overspeed** violations.
 
 ## Features
