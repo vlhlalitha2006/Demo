@@ -16,3 +16,14 @@ output/
 
 # OS
 .DS_Store
+
+# Large files (not for git)
+*.mp4
+*.avi
+*.mov
+*.pt
+yolov8*.pt
+
+# Logs
+*.log
+streamlit.log
